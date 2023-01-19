@@ -1,0 +1,1 @@
+cd linux && make ARCH=x86 -j12 && cp arch/x86/boot/bzImage ../bzImage
