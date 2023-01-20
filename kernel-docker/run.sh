@@ -1,5 +1,5 @@
 docker build -t phoenixillusion/v86-linux .
-mkdir -p output
+mkdir -p build
 docker run \
   --rm \
   --platform linux/386 \

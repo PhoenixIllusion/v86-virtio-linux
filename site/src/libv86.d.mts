@@ -1,5 +1,3 @@
-export const V86Starter: any;
-
 interface WasmExportsTable {
   exports: WebAssembly.Exports;
   wasm_table: WebAssembly.Table
@@ -28,6 +26,7 @@ type ImageObject = ImagesUrl|ImageBuffer;
 
 
 export class CPU {
+  emulator_bus: BusConnector;
   constructor(public bus: BusConnector, wm: WasmExportsTable, next_tick_immediately: () => void);
   clear_opstats();
   create_jit_imports();

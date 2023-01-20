@@ -59,7 +59,7 @@ class UTF8StreamToUnicode {
 export class Marshall {
 
   // Inserts data from an array to a byte aligned struct in memory
-  static Marshall(typeList: MarshallType[], input: (number | number[] | string)[], struct: Uint8Array, offset: number): number {
+  static Marshall(typeList: MarshallType[], input: (number | number[] | string)[], struct: Uint8Array|number[], offset: number): number {
     var size = 0;
     for (var i = 0; i < typeList.length; i++) {
       const item = input[i] as number;
@@ -116,7 +116,11 @@ export class Marshall {
     }
     return size;
   }
-
+  static MarshallToArray(typeList: MarshallType[], input: (number | number[] | string)[]): number[] {
+    const ret:number[] = []
+    this.Marshall(typeList,input,ret, 0);
+    return ret;
+  }
 
   // Extracts data from a byte aligned struct in memory to an array
   static Unmarshall(typeList: MarshallType[], struct: Uint8Array, state: { offset: number }) {
