@@ -37,8 +37,6 @@ const VIRTIO_9P_MAX_TAGLEN = 254;
 interface P9FileSystemEntry extends FileSystemEntry {
   type: number;
   crc32: number;
-  isOpen: boolean;
-  mode: number;
 }
 
 
@@ -68,13 +66,14 @@ export class Virtio9p {
   VERSION = "9P2000.u";
   BLOCKSIZE = 8192; // Let's define one page.
   msize = 8192; // maximum message size
+  IOUNIT = this.msize - 24;
   replybuffer = new Uint8Array(this.msize * 2); // Twice the msize to stay on the safe site
   replybuffersize = 0;
 
   virtio: VirtIO;
   virtqueue: VirtQueue;
 
-
+  fidState: {[fid: number]: {open: boolean, mode: number}} = {};
   fid2qid: {[fid: number]: P9FileSystemEntry} = {};
   path2qid: {[path: string]: P9FileSystemEntry} = {};
 
@@ -185,12 +184,20 @@ export class Virtio9p {
         this.onWalk(bufchain, id, tag, buffer, state);
         break;
       }
+      case P9Command.P9_TOPEN: { 
+        this.onOpen(bufchain, id, tag, buffer, state);
+        break;
+      }
+      case P9Command.P9_TCREATE: { 
+        this.onCreate(bufchain, id, tag, buffer, state);
+        break;
+      }
       case P9Command.P9_TREAD: { 
         this.onRead(bufchain, id, tag, buffer, state);
         break;
       }
-      case P9Command.P9_TOPEN: { 
-        this.onOpen(bufchain, id, tag, buffer, state);
+      case P9Command.P9_TWRITE: { 
+        this.onWrite(bufchain, id, tag, buffer, state);
         break;
       }
       case P9Command.P9_TCLUNK: { 
@@ -198,8 +205,9 @@ export class Virtio9p {
         break;
       }
       default:
-        this.SendError(tag, `${this.lookupP9Command(id)} (0x${id.toString(16)}/${id}) not supported`, ErrorCodes.EOPNOTSUPP_P9);
-        this.SendReply(bufchain);
+        this.SendError(tag, 
+          `${this.lookupP9Command(id)} (0x${id.toString(16)}/${id}) not supported`,
+          ErrorCodes.EOPNOTSUPP_P9, bufchain);
     }
   }
   lookupP9Command(id: P9Command): string {
@@ -309,7 +317,7 @@ export class Virtio9p {
     var qid = this.get_qid(fid);
     if(qid === undefined) {
       message.Debug("No such QID found for fid=" + fid);
-      this.SendError(tag, "Walk: Invalid FID", ErrorCodes.ENOENT);
+      this.SendError(tag, "Walk: Invalid FID", ErrorCodes.ENOENT, bufchain);
       return;
     }
     if (nwname === 0) {
@@ -319,12 +327,12 @@ export class Virtio9p {
     }
     if(!qid.isDir) {
       message.Debug(`Walk: FID not a Directory, fid=${fid} = qid=${qid.fullPath}`);
-      this.SendError(tag, "Walk: FID not a Directory", ErrorCodes.ENOTDIR);
+      this.SendError(tag, "Walk: FID not a Directory", ErrorCodes.ENOTDIR, bufchain);
       return;
     }
-    if(qid.isOpen) {
+    if(this.fidState[fid].open) {
       message.Debug(`Walk: FID currently open, fid=${fid} = qid=${qid.fullPath}`);
-      this.SendError(tag, "Walk: FID currently open", ErrorCodes.EIO);
+      this.SendError(tag, "Walk: FID currently open", ErrorCodes.EIO, bufchain);
       return;
     }
     const wnames: MarshallType[] = [];
@@ -335,6 +343,10 @@ export class Virtio9p {
 
     message.Debug("[walk ...] fid=" + fid + ", nwfid=" + nwfid + ", ... " + dirToWalk.join(','));
     const resp = (await this.fs.walk(qid, dirToWalk)).map(entry => this.wrapFileEntry(entry));
+    if(resp.length == 0) {
+      this.SendError(tag, "No such file or directory", ErrorCodes.ENOENT, bufchain);
+      return;
+    }
     if(resp.length == nwname) {
       this.add_qid(nwfid,resp[resp.length-1]);
     }
@@ -346,7 +358,7 @@ export class Virtio9p {
     const qid = this.get_qid(fid);
     if(!qid) {
       message.Debug("No such QID found for fid=" + fid);
-      this.SendError(tag, "Walk: Invalid FID", ErrorCodes.ENOENT);
+      this.SendError(tag, "No such file or directory", ErrorCodes.ENOENT, bufchain);
       return;
     }
     message.Debug("[stat] fid=" + fid+" - "+qid.fullPath);
@@ -370,7 +382,7 @@ export class Virtio9p {
     const qid = this.get_qid(fid);
     if(!qid) {
       message.Debug("No such QID found for fid=" + fid);
-      this.SendError(tag, "Walk: Invalid FID", ErrorCodes.ENOENT);
+      this.SendError(tag, "No such file or directory", ErrorCodes.ENOENT, bufchain);
       return;
     }
 
@@ -379,7 +391,7 @@ export class Virtio9p {
       const entries = (await this.fs.readDir(qid)).map(entry => this.wrapFileEntry(entry));
       data = entries.map(entry => this.build_stat(entry)).map(stat => Marshall.MarshallToArray(stat.types,stat.data).slice(2)).flat(1);
     } else {
-      data = (await this.fs.readFile(qid));
+      data = (await this.fs.readFile(qid, offset, count));
     }
     count = Math.min(count, this.replybuffer.length - (7 + 4));
     if(offset) {
@@ -393,6 +405,25 @@ export class Virtio9p {
     this.BuildReply(id, tag, 4 + count);
     this.SendReply(bufchain);
   }
+  async onWrite(bufchain: VirtQueueBufferChain, id: P9Command, tag: number, buffer: Uint8Array, state: {offset: number}) {
+    const req = Marshall.Unmarshall(["w", "w", "w", "w"], buffer, state);
+    const fid = req[0] as number;
+    const offset = req[1] as number;
+    const offset2 = req[2] as number;
+    let count = req[3] as number;
+    const data = buffer.subarray(state.offset, state.offset+count);
+
+    message.Debug("[write] fid=" + fid + ", offset=" + offset + ", count=" + count);
+    const qid = this.get_qid(fid);
+    if(!qid) {
+      message.Debug("No such QID found for fid=" + fid);
+      this.SendError(tag, "No such file or directory", ErrorCodes.ENOENT, bufchain);
+      return;
+    }
+    const written = await this.fs.writeFile(qid, offset, data);
+    this.replyMarshalledData(bufchain, id, tag, ['w'], [written]);
+
+  }
   async onOpen(bufchain: VirtQueueBufferChain, id: P9Command, tag: number, buffer: Uint8Array, state: {offset: number}) {
     const req = Marshall.Unmarshall(["w","b"], buffer, state);
     const fid = req[0] as number;
@@ -402,11 +433,41 @@ export class Virtio9p {
     const qid = this.get_qid(fid);
     if(!qid) {
       message.Debug("No such QID found for fid=" + fid);
-      this.SendError(tag, "Walk: Invalid FID", ErrorCodes.ENOENT);
+      this.SendError(tag, "No such file or directory", ErrorCodes.ENOENT, bufchain);
       return;
     }
+    this.fidState[fid].open = true;
+    this.fidState[fid].mode = mode;
     
-    this.replyMarshalledData(bufchain, id, tag, ["Q","w"], [this.qidFromFileEntry(qid),this.msize - 24]);
+    this.replyMarshalledData(bufchain, id, tag, ["Q","w"], [this.qidFromFileEntry(qid),this.IOUNIT]);
+  }
+  async onCreate(bufchain: VirtQueueBufferChain, id: P9Command, tag: number, buffer: Uint8Array, state: {offset: number}) {
+    const req = Marshall.Unmarshall(["w", "s", "w", "b", "s"], buffer, state);
+    const fid = req[0] as number; //parent DIR
+    const name = req[1] as string;
+    const perm = req[2] as number;
+    const mode = req[3] as number;
+    const extension = req[4] as string;
+
+    message.Debug("[create] fid=" + fid + ", name=" + name + ", perm=" + perm.toString(16)
+    + ", mode=" + mode.toString(2) + ", extension=" + extension);
+    const qid = this.get_qid(fid);
+    if(!qid) {
+      message.Debug("No such QID found for fid=" + fid);
+      this.SendError(tag, "No such file or directory", ErrorCodes.ENOENT, bufchain);
+      return;
+    }
+    const isFile = perm & 0x80000000 ? false : true;
+
+    const entry = await (isFile?
+      this.fs.createFile(qid, {name, perm, mode, extension})
+      : 
+      this.fs.createDir(qid, {name, perm, mode, extension})
+    );
+    const pEntry = this.wrapFileEntry(entry);
+    this.add_qid(fid, pEntry);
+
+    this.replyMarshalledData(bufchain, id, tag, ["Q","w"], [this.qidFromFileEntry(pEntry),this.IOUNIT]);
   }
 
   async onClunk(bufchain: VirtQueueBufferChain, id: P9Command, tag: number, buffer: Uint8Array, state: {offset: number}) {
@@ -416,7 +477,7 @@ export class Virtio9p {
     const qid = this.get_qid(fid);
     if(!qid) {
       message.Debug("No such QID found for fid=" + fid);
-      this.SendError(tag, "Walk: Invalid FID", ErrorCodes.ENOENT);
+      this.SendError(tag, "No such file or directory", ErrorCodes.ENOENT, bufchain);
       return;
     }
     message.Debug("[clunk] fid=" + fid +" - "+qid.fullPath);
@@ -447,11 +508,12 @@ export class Virtio9p {
     this.virtqueue.push_reply(bufchain);
     this.virtqueue.flush_replies();
 }
-  SendError(tag: number, errormsg: string, errorcode: ErrorCodes) {
+  SendError(tag: number, errormsg: string, errorcode: ErrorCodes,bufchain: VirtQueueBufferChain) {
     message.Debug(`SendError ${tag} ${errormsg} ${errorcode}`);
     const size = Marshall.Marshall(["s", "w"], [errormsg, errorcode], this.replybuffer, 7);
-    //var size = Marshall.Marshall(["w"], [errorcode], this.replybuffer, 7);
-    this.BuildReply(P9Command.P9_RERROR, tag, size);
+    //const size = Marshall.Marshall(["w"], [errorcode], this.replybuffer, 7);
+    this.BuildReply(P9Command.P9_RERROR-1, tag, size);
+    this.SendReply(bufchain);
   }
 
   qidFromFileEntry(entry: P9FileSystemEntry): number[] {
@@ -472,10 +534,8 @@ export class Virtio9p {
   }
 
   wrapFileEntry(entry: FileSystemEntry): P9FileSystemEntry {
-    const ret: P9FileSystemEntry = {} as any as P9FileSystemEntry;
-    Object.assign(ret, entry);
+    const ret: P9FileSystemEntry = entry as any as P9FileSystemEntry;
     ret.type = entry.isDir? P9QidTypes.P9_QTDIR: P9QidTypes.P9_QTFILE;
-    ret.isOpen = false;
     ret.crc32 = this.hashCode32(entry.fullPath);
     return ret;
   }
@@ -484,11 +544,13 @@ export class Virtio9p {
       //display.log("Adding fid=" + fid + ", name=" + qid.name + ", fullPath=" + qid.entry.fullPath);
       this.fid2qid[fid] = entry;
       this.path2qid[entry.fullPath] = entry;
+      this.fidState[fid] = {open: false, mode: 0};
   }
   del_qid(fid: number) {
     var qid = this.fid2qid[fid];
     delete this.fid2qid[fid];
     delete this.path2qid[qid.fullPath];
+    delete this.fidState[fid];
   }
   get_qid(fid_or_path: number|string): P9FileSystemEntry|undefined {
       if (typeof fid_or_path == "number")
@@ -530,7 +592,7 @@ export class Virtio9p {
         0,  // type
         0,  // dev
         qid,  // qid
-        (qid[0] & 0x80) ? (0x80000000 | 0x755) : 0x644,  // mode
+        (qid[0] & 0x80) ? (0x80000000 | 0o777) : 0o777,  // mode (0x755 | 0x644)
         entry.atime,  // atime
         entry.mtime,  // mtime
         entry.size,  // length0 FIXME
