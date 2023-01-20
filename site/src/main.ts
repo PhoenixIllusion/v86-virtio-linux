@@ -1,10 +1,9 @@
 import './style.css'
 import '../node_modules/xterm/css/xterm.css'
 
-import { V86Starter, V8StarterOptions }from './libv86.mjs';
+import { type V8StarterOptions }from './libv86.mjs';
 import { FileSystem, FileSystemEntry } from './filesystem';
 import { Virtio9p } from './v9pfs';
-import { Terminal } from 'xterm';
 
 
 
@@ -84,35 +83,37 @@ const testFileSystem: FileSystem = {
     return new Uint8Array([]);
   }
 }
+const run = async() =>{
+    const V86Starter = (await import('./libv86.mjs')).V86Starter;
+    const emulator = new V86Starter(options);
+    emulator.bus.register('emulator-loaded', () => {
+      const vp9fs = new Virtio9p(emulator.v86.cpu, testFileSystem);
+      emulator.run();
+      setTimeout(() => {
+        const data = '    mkdir -p v9 && mount -t 9p -o trans=virtio -o version=9p2000.u -o msize=8192 -o debug=100 host9p /v9';
+        for(let i = 0; i < data.length; i++)
+        {
+          emulator.bus.send("serial0-input", data.charCodeAt(i));
+        }
+      },0);
+    }, emulator)
 
-const emulator = new V86Starter(options);
-emulator.bus.register('emulator-loaded', () => {
-  const vp9fs = new Virtio9p(emulator.v86.cpu, testFileSystem);
-  emulator.run();
-  setTimeout(() => {
-    const data = '    mkdir -p v9 && mount -t 9p -o trans=virtio -o version=9p2000.u -o msize=8192 -o debug=100 host9p /v9';
-    for(let i = 0; i < data.length; i++)
+    const Terminal = (await import('xterm')).default.Terminal;
+    const term = new Terminal();
+    term.open(document.getElementById('terminal') as HTMLElement);
+    emulator.bus.register("serial0-output-char", (chr: string) => 
     {
-      emulator.bus.send("serial0-input", data.charCodeAt(i));
-    }
-  },0);
-}, emulator)
+      term.write(chr);
+    }, emulator);
 
 
-const term = new Terminal();
-term.open(document.getElementById('terminal') as HTMLElement);
-emulator.bus.register("serial0-output-char", (chr: string) => 
-{
-  term.write(chr);
-}, emulator);
-
-
-term.onData((data) =>
-{
-  for(let i = 0; i < data.length; i++)
-  {
-    emulator.bus.send("serial0-input", data.charCodeAt(i));
-  }
-});
-
+    term.onData((data) =>
+    {
+      for(let i = 0; i < data.length; i++)
+      {
+        emulator.bus.send("serial0-input", data.charCodeAt(i));
+      }
+    });
+}
+run();
 
