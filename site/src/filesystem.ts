@@ -25,4 +25,9 @@ export interface FileSystem {
   createDir(parent: FileSystemEntry, params: CreationParams): Promise<FileSystemEntry>;
   createFile(parent: FileSystemEntry, params: CreationParams): Promise<FileSystemEntry>;
   writeFile(qid: FileSystemEntry, offset: number, buffer: Uint8Array): Promise<number>;
+  rename(qid: FileSystemEntry, newName: string): Promise<void>;
+  resize(qid: FileSystemEntry, size0: number, size1: number): Promise<void>;
+  remove(qid: FileSystemEntry): Promise<void>;
+  onOpen(qid: FileSystemEntry): Promise<void>;
+  onClose(qid: FileSystemEntry): Promise<void>;
 }

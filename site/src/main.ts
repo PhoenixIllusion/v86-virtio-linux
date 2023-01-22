@@ -31,7 +31,10 @@ const options: V8StarterOptions = {
 }
 
 const encoder = new TextEncoder();
-const fakeFile = (name: string, fullPath: string, content: Uint8Array) => ({
+interface FakeEntry extends FileSystemEntry {
+  content: Uint8Array;
+}
+const fakeFile = (name: string, fullPath: string, content: Uint8Array): FakeEntry => ({
   isDir: false,
   isFile: true,
   mtime: 0,
@@ -69,11 +72,14 @@ const arch: Arch = {
 
 const testFileSystem: FileSystem = {
   async walk(qid: FileSystemEntry, dirToWalk: string[]): Promise<FileSystemEntry[]> {
-    const ret:FileSystemEntry[] = [];
+    const ret: FileSystemEntry[] = [];
     let path = qid.fullPath;
     dirToWalk.forEach(walkPath => {
-      if(arch[path + walkPath]) {
+      if (arch[path + walkPath]) {
         ret.push(arch[path + walkPath]);
+      }
+      if (arch[path + walkPath + '/']) {
+        ret.push(arch[path + walkPath + '/']);
       }
       path += walkPath + '/';
     });
@@ -85,22 +91,24 @@ const testFileSystem: FileSystem = {
   async readDir(qid: FileSystemEntry): Promise<FileSystemEntry[]> {
     const paths = Object.keys(arch)
       .filter(path => path != qid.fullPath && path.startsWith(qid.fullPath))
-      .filter(path => !path.substring(qid.fullPath.length).match(/.\/./))
+      .filter(path => !path.substring(qid.fullPath.length).match(/.\/./));
     return paths.map(path => arch[path]);
   },
   async readFile(qid: FileSystemEntry, offset: number, len: number): Promise<Uint8Array> {
-    if((qid as any)['content']) {
-      return (qid as any)['content'];
+    const entry = qid as FakeEntry;
+    if (entry.content) {
+      return entry.content;
     }
     return new Uint8Array([]);
   },
   async writeFile(qid: FileSystemEntry, offset: number, buffer: Uint8Array): Promise<number> {
-    if((qid as any)['content']) {
-      let curBuffer = (qid as any)['content'] as Uint8Array;
-      if(qid.size < offset + buffer.length) {
+    const entry = qid as FakeEntry;
+    if (entry.content) {
+      let curBuffer = entry.content;
+      if (qid.size < offset + buffer.length) {
         const newBuffer = new Uint8Array(offset + buffer.length);
         newBuffer.set(curBuffer);
-        (qid as any)['content'] = curBuffer = newBuffer;
+        entry.content = curBuffer = newBuffer;
       }
       curBuffer.set(buffer, offset);
       qid.size = curBuffer.length;
@@ -109,14 +117,42 @@ const testFileSystem: FileSystem = {
     return 0;
   },
   async createFile(qid: FileSystemEntry, param: CreationParams): Promise<FileSystemEntry> {
-    const file = fakeFile(param.name, qid.fullPath+param.name, new Uint8Array([]));
+    const file = fakeFile(param.name, qid.fullPath + param.name, new Uint8Array([]));
     arch[file.fullPath] = file;
     return file;
   },
   async createDir(qid: FileSystemEntry, param: CreationParams): Promise<FileSystemEntry> {
-    const file = fakeDir(param.name, qid.fullPath+param.name+'/');
+    const file = fakeDir(param.name, qid.fullPath + param.name + '/');
     arch[file.fullPath] = file;
     return file;
+  },
+  async rename(qid: FileSystemEntry, newName: string): Promise<void> {
+    const paths = qid.fullPath.split('/');
+    if(qid.isDir) {
+      paths[paths.length-2] = newName;
+    }
+    if(qid.isFile) {
+      paths[paths.length-1] = newName;
+    }
+    delete arch[qid.fullPath];
+    qid.fullPath = paths.join('/');
+    arch[qid.fullPath] = qid;
+    qid.name = newName;
+  },
+  async resize(qid: FileSystemEntry, size0: number, size1: number): Promise<void> {
+    const entry = qid as FakeEntry;
+    if (entry.content) {
+      entry.content = entry.content.subarray(0, size0);
+    }
+  },
+  async remove(qid: FileSystemEntry): Promise<void> {
+    delete arch[qid.fullPath];
+  },
+  async onOpen(qid: FileSystemEntry): Promise<void> {
+    
+  },
+  async onClose(qid: FileSystemEntry): Promise<void> {
+    
   }
 }
 const run = async() =>{
@@ -126,7 +162,8 @@ const run = async() =>{
       const vp9fs = new Virtio9p(emulator.v86.cpu, testFileSystem);
       emulator.run();
       setTimeout(() => {
-        const data = '    mkdir -p v9 && mount -t 9p -o trans=virtio -o version=9p2000.u -o msize=8192 -o debug=100 host9p /v9';
+        //https://www.kernel.org/doc/Documentation/filesystems/9p.txt
+        const data = '    mkdir -p v9 && mount -t 9p -o trans=virtio -o version=9p2000.u -o msize=8192 -o debug=0x1FF host9p /v9';
         for(let i = 0; i < data.length; i++)
         {
           emulator.bus.send("serial0-input", data.charCodeAt(i));

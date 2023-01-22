@@ -18,7 +18,8 @@ github: https://github.com/ericvh/9p-rfc
 P2000  : http://ericvh.github.io/9p-rfc/rfc9p2000.html
 P2000.u: http://ericvh.github.io/9p-rfc/rfc9p2000.u.html
 
-
+Kernel Interface
+https://www.kernel.org/doc/Documentation/filesystems/9p.txt
 */
 
 import { BusConnector, CPU, VirtIO, VirtQueue, v86util, VirtQueueBufferChain, VirtIO_CapabilityStruct } from './libv86.mjs';
@@ -75,7 +76,6 @@ export class Virtio9p {
 
   fidState: {[fid: number]: {open: boolean, mode: number}} = {};
   fid2qid: {[fid: number]: P9FileSystemEntry} = {};
-  path2qid: {[path: string]: P9FileSystemEntry} = {};
 
   constructor(cpu: CPU, private fs: FileSystem) {
     this.virtio = new VirtIO(cpu,
@@ -198,6 +198,14 @@ export class Virtio9p {
       }
       case P9Command.P9_TWRITE: { 
         this.onWrite(bufchain, id, tag, buffer, state);
+        break;
+      }
+      case P9Command.P9_TWSTAT: { 
+        this.onWriteStat(bufchain, id, tag, buffer, state);
+        break;
+      }
+      case P9Command.P9_TREMOVE: { 
+        this.onRemove(bufchain, id, tag, buffer, state);
         break;
       }
       case P9Command.P9_TCLUNK: { 
@@ -424,6 +432,29 @@ export class Virtio9p {
     this.replyMarshalledData(bufchain, id, tag, ['w'], [written]);
 
   }
+  async onWriteStat(bufchain: VirtQueueBufferChain, id: P9Command, tag: number, buffer: Uint8Array, state: {offset: number}) {
+    const req = Marshall.Unmarshall(["w", ... this.statTypes], buffer, state);
+    const fid = req[0] as number;
+    const sizeOfMessage = req[1] as number; //I think this is always stat-size + 2?
+
+    const qid = this.get_qid(fid);
+    if(!qid) {
+      message.Debug("No such QID found for fid=" + fid);
+      this.SendError(tag, "No such file or directory", ErrorCodes.ENOENT, bufchain);
+      return;
+    }
+    const stat = this.wrapStats(req.slice(2));
+    console.log(fid, sizeOfMessage, stat);
+    if(qid.name != stat.name && stat.name != "" /* empty is do not touch */) {
+      console.log("Rename: ", qid.name, stat.name);
+      await this.fs.rename(qid, stat.name);
+    }
+    if(stat.length0 != 0xFFFFFFFF && stat.length1 != 0xFFFFFFFF) {
+      console.log("Resize from ", qid.size, ' to ', stat.length0)
+      await this.fs.resize(qid, stat.length0, stat.length1);
+    }
+    this.replyMarshalledData(bufchain, id, tag, [], []);
+  }
   async onOpen(bufchain: VirtQueueBufferChain, id: P9Command, tag: number, buffer: Uint8Array, state: {offset: number}) {
     const req = Marshall.Unmarshall(["w","b"], buffer, state);
     const fid = req[0] as number;
@@ -469,7 +500,22 @@ export class Virtio9p {
 
     this.replyMarshalledData(bufchain, id, tag, ["Q","w"], [this.qidFromFileEntry(pEntry),this.IOUNIT]);
   }
+  async onRemove(bufchain: VirtQueueBufferChain, id: P9Command, tag: number, buffer: Uint8Array, state: {offset: number}) {
+    const req = Marshall.Unmarshall(["w"], buffer, state);
+    const fid = req[0] as number;
 
+    message.Debug("[remove] fid=" + fid);
+    const qid = this.get_qid(fid);
+    if(!qid) {
+      message.Debug("No such QID found for fid=" + fid);
+      this.SendError(tag, "No such file or directory", ErrorCodes.ENOENT, bufchain);
+      return;
+    }
+    await this.fs.remove(qid);
+
+    this.del_qid(fid);
+    this.replyMarshalledData(bufchain, id, tag, [], []);
+  }
   async onClunk(bufchain: VirtQueueBufferChain, id: P9Command, tag: number, buffer: Uint8Array, state: {offset: number}) {
     const req = Marshall.Unmarshall(["w"], buffer, state);
     const fid = req[0] as number;
@@ -543,49 +589,61 @@ export class Virtio9p {
   add_qid(fid: number, entry: P9FileSystemEntry) {
       //display.log("Adding fid=" + fid + ", name=" + qid.name + ", fullPath=" + qid.entry.fullPath);
       this.fid2qid[fid] = entry;
-      this.path2qid[entry.fullPath] = entry;
       this.fidState[fid] = {open: false, mode: 0};
   }
   del_qid(fid: number) {
-    var qid = this.fid2qid[fid];
     delete this.fid2qid[fid];
-    delete this.path2qid[qid.fullPath];
     delete this.fidState[fid];
   }
-  get_qid(fid_or_path: number|string): P9FileSystemEntry|undefined {
-      if (typeof fid_or_path == "number")
-          return this.fid2qid[fid_or_path];
-      else if (typeof fid_or_path == "string")
-          return this.path2qid[fid_or_path];
-      else
-          message.Debug("get_qid: unknown key type: " + (typeof fid_or_path));
-      return undefined;
+  get_qid(fid_or_path: number): P9FileSystemEntry|undefined {
+      return this.fid2qid[fid_or_path];
   }
 
-
+  statTypes: MarshallType[] = [
+    "h", //arm-js?
+    "h",  // size
+    "h",  // type
+    "w",  // dev
+    "Q",  // qid
+    "w",  // mode
+    "w",  // atime
+    "w",  // mtime
+    "w",  // length0
+    "w",  // length1
+    "s",  // name
+    "s",  // uid
+    "s",  // gid
+    "s",  // muid
+    "s",  // extension
+    "w",  // n_uid
+    "w",  // n_gid
+    "w"  // n_muid
+    ];
+  wrapStats(input: (number | number[] | string)[]) {
+    return {
+      size: input[0] as number,
+      type: input[1] as number,
+      dev: input[2] as number,
+      qid: input[3] as number[],
+      mode: input[4] as number,
+      atime: input[5] as number,
+      mtime: input[6] as number,
+      length0: input[7] as number,
+      length1: input[8] as number,
+      name: input[9] as string,
+      uid: input[10] as string,
+      gid: input[11] as string,
+      muid: input[12] as string,
+      extension: input[13] as string,
+      n_uid: input[14] as number,
+      n_gid: input[15] as number,
+      n_muid: input[16] as number
+    }
+  }
   build_stat(entry: P9FileSystemEntry) {
     const qid = this.qidFromFileEntry(entry);
     //display.log("qid.type=" + qid.type.toString(16));
-    var types: MarshallType[] = [
-        "h", //arm-js?
-        "h",  // size
-        "h",  // type
-        "w",  // dev
-        "Q",  // qid
-        "w",  // mode
-        "w",  // atime
-        "w",  // mtime
-        "w",  // length0
-        "w",  // length1
-        "s",  // name
-        "s",  // uid
-        "s",  // gid
-        "s",  // muid
-        "s",  // extension
-        "w",  // n_uid
-        "w",  // n_gid
-        "w"  // n_muid
-        ];
+
     var data = [
         0, //arm-js?
         0,  // size
@@ -607,6 +665,6 @@ export class Virtio9p {
         0  // n_muid
         ];
 
-    return {types,data};
+    return {types: this.statTypes,data};
 };
 }
